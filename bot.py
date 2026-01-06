@@ -1,124 +1,168 @@
+import os
 import re
 import requests
 from http.cookiejar import MozillaCookieJar
 from pyrogram import Client, filters
 
-# ── CONFIG ──
-API_ID = 123456
-API_HASH = "API_HASH"
-BOT_TOKEN = "BOT_TOKEN"
+# ─── ENV CONFIG ───
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ── OPTIONAL FREE PROXIES (unstable; try only if cookies fail) ──
+# ─── OPTIONAL FREE PROXY (leave empty if not using) ───
 PROXIES = [
-    # "http://username:password@ip:port",
     # "http://ip:port",
+    # "http://user:pass@ip:port"
 ]
 
-def get_session(use_proxy=False):
-    cookies = MozillaCookieJar("cookies.txt")
-    cookies.load(ignore_discard=True, ignore_expires=True)
+# ─── SESSION CREATOR ───
+def create_session(use_proxy=False):
+    jar = MozillaCookieJar("cookies.txt")
+    jar.load(ignore_discard=True, ignore_expires=True)
 
     s = requests.Session()
-    s.cookies = cookies
+    s.cookies = jar
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
         "Referer": "https://dm.1024terabox.com/",
         "Accept": "application/json, text/plain, */*",
     })
+
     if use_proxy and PROXIES:
         s.proxies.update({
             "http": PROXIES[0],
             "https": PROXIES[0],
         })
+
     return s
 
-session = get_session(use_proxy=False)
 
-app = Client("terabox-simple", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+session = create_session()
 
-# ── HELPERS ──
-def extract_surl(link):
-    m = re.search(r"(surl=|/s/)([A-Za-z0-9_-]+)", link)
+# ─── PYROGRAM BOT ───
+app = Client(
+    "terabox-link-to-video",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# ─── HELPERS ───
+def extract_surl(url):
+    m = re.search(r"(surl=|/s/)([A-Za-z0-9_-]+)", url)
     return m.group(2) if m else None
 
-def api_shortinfo(surl):
-    url = "https://dm.1024terabox.com/api/shorturlinfo"
-    r = session.get(url, params={"surl": surl}, timeout=20)
+
+def shorturl_info(surl):
+    api = "https://dm.1024terabox.com/api/shorturlinfo"
+    r = session.get(api, params={"surl": surl}, timeout=20)
+
     if r.status_code != 200:
-        raise Exception(f"API HTTP {r.status_code}")
+        raise Exception(f"HTTP {r.status_code}")
+
     data = r.json()
     if "list" not in data:
-        # common reasons: private / expired / password
-        raise Exception(data.get("errmsg", "Private / expired / blocked"))
+        raise Exception(data.get("errmsg", "Private / expired / blocked link"))
+
     return data["list"]
 
-def collect_files(items, base_path=""):
+
+def collect_files(items, path=""):
     files = []
-    for it in items:
-        if it.get("isdir") == 1:
-            # folder → recurse via list API
-            fs_id = it.get("fs_id")
+
+    for item in items:
+        if item.get("isdir") == 1:
+            fs_id = item.get("fs_id")
             if not fs_id:
                 continue
-            url = "https://dm.1024terabox.com/api/list"
-            r = session.get(url, params={"dir": fs_id}, timeout=20)
+
+            api = "https://dm.1024terabox.com/api/list"
+            r = session.get(api, params={"dir": fs_id}, timeout=20)
             if r.status_code != 200:
                 continue
+
             j = r.json()
-            files += collect_files(j.get("list", []), base_path + it.get("name", "") + "/")
+            files.extend(
+                collect_files(
+                    j.get("list", []),
+                    path + item.get("name", "") + "/"
+                )
+            )
         else:
-            if it.get("dlink"):
-                files.append((base_path + it.get("name", "video.mp4"), it["dlink"]))
+            if item.get("dlink"):
+                files.append(
+                    (path + item.get("name", "video.mp4"), item["dlink"])
+                )
+
     return files
 
-def resolve_all_videos(link):
-    # follow redirects (supports teraboxlink / www / dm / wap)
+
+def resolve_videos(link):
+    # follow redirects (teraboxlink / www / dm / wap)
     r = session.get(link, allow_redirects=True, timeout=20)
     surl = extract_surl(r.url)
+
     if not surl:
         raise Exception("Invalid Terabox link")
 
-    root_list = api_shortinfo(surl)
-    files = collect_files(root_list)
+    root_items = shorturl_info(surl)
+    videos = collect_files(root_items)
 
-    if not files:
+    if not videos:
         raise Exception("No downloadable videos found")
-    return files
 
-# ── BOT ──
-@app.on_message(filters.text & ~filters.command)
-async def handler(_, message):
+    return videos
+
+
+# ─── BOT HANDLER ───
+@app.on_message(filters.text)
+async def handle_message(client, message):
     text = message.text.strip()
+
+    # ignore commands
+    if text.startswith("/"):
+        return
+
+    # quick filter
     if "tera" not in text.lower():
         return
 
-    m = await message.reply("⏳ Resolving link...")
+    status = await message.reply("⏳ Processing Terabox link...")
 
     try:
-        files = resolve_all_videos(text)
+        videos = resolve_videos(text)
 
         sent = 0
-        for name, dlink in files:
+        for name, url in videos:
             await message.reply_video(
-                video=dlink,
+                video=url,
                 caption=f"🎬 {name}"
             )
             sent += 1
-            if sent >= 5:  # safety cap (avoid spam)
+
+            if sent >= 5:  # anti-spam safety
                 break
 
-        await m.edit_text(f"✅ Sent {sent} video(s)")
+        await status.edit_text(f"✅ Sent {sent} video(s)")
 
     except Exception as e:
-        # retry once with proxy if configured
+        # retry once with proxy if available
         try:
             global session
-            session = get_session(use_proxy=True)
-            files = resolve_all_videos(text)
-            name, dlink = files[0]
-            await message.reply_video(video=dlink, caption=f"🎬 {name}")
-            await m.edit_text("⚠️ Used proxy fallback, sent 1 video")
-        except Exception as e2:
-            await m.edit_text(f"❌ Error: {str(e)}")
+            session = create_session(use_proxy=True)
+            videos = resolve_videos(text)
+            name, url = videos[0]
 
+            await message.reply_video(
+                video=url,
+                caption=f"🎬 {name}\n⚠️ Used proxy fallback"
+            )
+            await status.edit_text("⚠️ Proxy fallback used")
+
+        except Exception as e2:
+            await status.edit_text(f"❌ Error: {e}")
+
+
+# ─── START BOT ───
+print("🤖 Terabox bot started")
 app.run()
