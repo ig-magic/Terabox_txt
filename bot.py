@@ -1,22 +1,30 @@
 import os
 import re
+import threading
 import requests
 from http.cookiejar import MozillaCookieJar
+from flask import Flask
 from pyrogram import Client, filters
 
-# ─── ENV CONFIG ───
+# ───────────────── ENV ─────────────────
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ─── OPTIONAL FREE PROXY (leave empty if not using) ───
-PROXIES = [
-    # "http://ip:port",
-    # "http://user:pass@ip:port"
-]
+# ───────────────── FLASK (PORT BIND FOR RENDER) ─────────────────
+web = Flask(__name__)
 
-# ─── SESSION CREATOR ───
-def create_session(use_proxy=False):
+@web.route("/")
+def home():
+    return "✅ Terabox Bot is running"
+
+def run_web():
+    web.run(host="0.0.0.0", port=8080)
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# ───────────────── REQUEST SESSION ─────────────────
+def create_session():
     jar = MozillaCookieJar("cookies.txt")
     jar.load(ignore_discard=True, ignore_expires=True)
 
@@ -25,29 +33,21 @@ def create_session(use_proxy=False):
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
         "Referer": "https://dm.1024terabox.com/",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json, text/plain, */*"
     })
-
-    if use_proxy and PROXIES:
-        s.proxies.update({
-            "http": PROXIES[0],
-            "https": PROXIES[0],
-        })
-
     return s
-
 
 session = create_session()
 
-# ─── PYROGRAM BOT ───
+# ───────────────── PYROGRAM BOT ─────────────────
 app = Client(
-    "terabox-link-to-video",
+    "terabox-web-service",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# ─── HELPERS ───
+# ───────────────── HELPERS ─────────────────
 def extract_surl(url):
     m = re.search(r"(surl=|/s/)([A-Za-z0-9_-]+)", url)
     return m.group(2) if m else None
@@ -98,7 +98,6 @@ def collect_files(items, path=""):
 
 
 def resolve_videos(link):
-    # follow redirects (teraboxlink / www / dm / wap)
     r = session.get(link, allow_redirects=True, timeout=20)
     surl = extract_surl(r.url)
 
@@ -113,17 +112,15 @@ def resolve_videos(link):
 
     return videos
 
-
-# ─── BOT HANDLER ───
+# ───────────────── BOT HANDLER ─────────────────
 @app.on_message(filters.text)
-async def handle_message(client, message):
+async def handler(client, message):
     text = message.text.strip()
 
     # ignore commands
     if text.startswith("/"):
         return
 
-    # quick filter
     if "tera" not in text.lower():
         return
 
@@ -139,30 +136,14 @@ async def handle_message(client, message):
                 caption=f"🎬 {name}"
             )
             sent += 1
-
-            if sent >= 5:  # anti-spam safety
+            if sent >= 5:
                 break
 
         await status.edit_text(f"✅ Sent {sent} video(s)")
 
     except Exception as e:
-        # retry once with proxy if available
-        try:
-            global session
-            session = create_session(use_proxy=True)
-            videos = resolve_videos(text)
-            name, url = videos[0]
+        await status.edit_text(f"❌ Error: {e}")
 
-            await message.reply_video(
-                video=url,
-                caption=f"🎬 {name}\n⚠️ Used proxy fallback"
-            )
-            await status.edit_text("⚠️ Proxy fallback used")
-
-        except Exception as e2:
-            await status.edit_text(f"❌ Error: {e}")
-
-
-# ─── START BOT ───
-print("🤖 Terabox bot started")
+# ───────────────── START ─────────────────
+print("🤖 Terabox bot started (Web Service mode)")
 app.run()
