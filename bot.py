@@ -1,102 +1,124 @@
-import os
+import re
 import requests
 from http.cookiejar import MozillaCookieJar
-from flask import Flask, request, jsonify
 from pyrogram import Client, filters
 
-# ─── ENV ───
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Render URL
+# ── CONFIG ──
+API_ID = 123456
+API_HASH = "API_HASH"
+BOT_TOKEN = "BOT_TOKEN"
 
-# ─── LOAD COOKIES ───
-cookies = MozillaCookieJar("cookies.txt")
-cookies.load(ignore_discard=True, ignore_expires=True)
+# ── OPTIONAL FREE PROXIES (unstable; try only if cookies fail) ──
+PROXIES = [
+    # "http://username:password@ip:port",
+    # "http://ip:port",
+]
 
-session = requests.Session()
-session.cookies = cookies
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
-    "Referer": "https://dm.1024terabox.com/",
-    "Accept": "*/*"
-})
+def get_session(use_proxy=False):
+    cookies = MozillaCookieJar("cookies.txt")
+    cookies.load(ignore_discard=True, ignore_expires=True)
 
-# ─── PYROGRAM APP (WEBHOOK MODE) ───
-app = Client(
-    "terabox-bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
-)
+    s = requests.Session()
+    s.cookies = cookies
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
+        "Referer": "https://dm.1024terabox.com/",
+        "Accept": "application/json, text/plain, */*",
+    })
+    if use_proxy and PROXIES:
+        s.proxies.update({
+            "http": PROXIES[0],
+            "https": PROXIES[0],
+        })
+    return s
 
-# ─── FLASK WEB ───
-web = Flask(__name__)
+session = get_session(use_proxy=False)
 
-# 🔹 Home / Health
-@web.route("/")
-def home():
-    return "✅ Bot is running", 200
+app = Client("terabox-simple", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# 🔹 Cookie Check Endpoint
-@web.route("/health")
-def cookie_health():
-    try:
-        r = session.get(
-            "https://dm.1024terabox.com/api/user/info",
-            timeout=15
-        )
-        if r.status_code == 200:
-            return jsonify({
-                "status": "ok",
-                "cookie": "valid"
-            })
-        return jsonify({
-            "status": "error",
-            "cookie": "invalid",
-            "code": r.status_code
-        }), 401
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "msg": str(e)
-        }), 500
+# ── HELPERS ──
+def extract_surl(link):
+    m = re.search(r"(surl=|/s/)([A-Za-z0-9_-]+)", link)
+    return m.group(2) if m else None
 
+def api_shortinfo(surl):
+    url = "https://dm.1024terabox.com/api/shorturlinfo"
+    r = session.get(url, params={"surl": surl}, timeout=20)
+    if r.status_code != 200:
+        raise Exception(f"API HTTP {r.status_code}")
+    data = r.json()
+    if "list" not in data:
+        # common reasons: private / expired / password
+        raise Exception(data.get("errmsg", "Private / expired / blocked"))
+    return data["list"]
 
-# ─── TELEGRAM HANDLER ───
+def collect_files(items, base_path=""):
+    files = []
+    for it in items:
+        if it.get("isdir") == 1:
+            # folder → recurse via list API
+            fs_id = it.get("fs_id")
+            if not fs_id:
+                continue
+            url = "https://dm.1024terabox.com/api/list"
+            r = session.get(url, params={"dir": fs_id}, timeout=20)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            files += collect_files(j.get("list", []), base_path + it.get("name", "") + "/")
+        else:
+            if it.get("dlink"):
+                files.append((base_path + it.get("name", "video.mp4"), it["dlink"]))
+    return files
+
+def resolve_all_videos(link):
+    # follow redirects (supports teraboxlink / www / dm / wap)
+    r = session.get(link, allow_redirects=True, timeout=20)
+    surl = extract_surl(r.url)
+    if not surl:
+        raise Exception("Invalid Terabox link")
+
+    root_list = api_shortinfo(surl)
+    files = collect_files(root_list)
+
+    if not files:
+        raise Exception("No downloadable videos found")
+    return files
+
+# ── BOT ──
 @app.on_message(filters.text & ~filters.command)
-async def terabox_handler(client, message):
+async def handler(_, message):
     text = message.text.strip()
-
-    if "terabox" not in text:
+    if "tera" not in text.lower():
         return
 
-    await message.reply("⏳ Processing Terabox link...")
+    m = await message.reply("⏳ Resolving link...")
 
     try:
-        api = "https://dm.1024terabox.com/api/shorturlinfo"
-        res = session.get(api, params={"shorturl": text}, timeout=20).json()
-        video_url = res["list"][0]["dlink"]
+        files = resolve_all_videos(text)
 
-        await message.reply_video(
-            video=video_url,
-            caption="✅ Terabox Video"
-        )
+        sent = 0
+        for name, dlink in files:
+            await message.reply_video(
+                video=dlink,
+                caption=f"🎬 {name}"
+            )
+            sent += 1
+            if sent >= 5:  # safety cap (avoid spam)
+                break
 
-    except Exception:
-        await message.reply("❌ Failed (cookie / link issue)")
+        await m.edit_text(f"✅ Sent {sent} video(s)")
 
+    except Exception as e:
+        # retry once with proxy if configured
+        try:
+            global session
+            session = get_session(use_proxy=True)
+            files = resolve_all_videos(text)
+            name, dlink = files[0]
+            await message.reply_video(video=dlink, caption=f"🎬 {name}")
+            await m.edit_text("⚠️ Used proxy fallback, sent 1 video")
+        except Exception as e2:
+            await m.edit_text(f"❌ Error: {str(e)}")
 
-# ─── WEBHOOK ROUTE ───
-@web.route("/webhook", methods=["POST"])
-async def telegram_webhook():
-    await app.process_update(request.get_json())
-    return "ok"
-
-
-# ─── START EVERYTHING ───
-if __name__ == "__main__":
-    app.start()
-    app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    web.run(host="0.0.0.0", port=8080)
+app.run()
